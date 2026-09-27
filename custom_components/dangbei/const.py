@@ -127,4 +127,5 @@ PLATFORMS: list[Platform] = [
     Platform.BUTTON,
     Platform.REMOTE,
     Platform.BINARY_SENSOR,
+    Platform.MEDIA_PLAYER,
 ]
