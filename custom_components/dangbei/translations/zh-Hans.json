@@ -87,6 +87,9 @@
     "binary_sensor": {
       "online": { "name": "在线" },
       "esp32_online": { "name": "ESP32 在线" }
+    },
+    "media_player": {
+      "tv": { "name": "电视" }
     }
   }
 }

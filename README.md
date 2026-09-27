@@ -10,6 +10,7 @@ Home Assistant 自定义集成，通过局域网 WebSocket 直连当贝投影仪
 
 - 13 个 `button` 实体：`up`、`down`、`left`、`right`、`ok`、`back`、`home`、`menu`、`volume_up`、`volume_down`、`side_menu`、`find_remote`、`screenshot`
 - 1 个 `remote` 实体：名称显示为 `Power`，支持 `remote.send_command`、`remote.turn_on`、`remote.turn_off`
+- 1 个 `media_player` 实体：`device_class: tv`，用于把投影仪以「电视」的方式接入 HomeKit，以便使用 iOS 遥控器，遥控按键会转成上面的 `button` 实体
 - 1 个 `binary_sensor` 实体：`online`，用于反映投影仪 WebSocket 是否在线
 - 配置流程会尝试通过 mDNS 发现投影仪，并通过 112 WebSocket 握手读取 `device_id`、蓝牙 MAC、设备名称、型号、ROM 等信息
 
@@ -164,6 +165,82 @@ service: remote.turn_on
 target:
   entity_id: remote.<your_projector_remote>
 ```
+
+## iOS 遥控器（HomeKit）
+
+集成会额外暴露一个 `media_player` 实体（`device_class: tv`）。把它交给 HomeKit 之后，
+iOS 控制中心 / 家庭 App 里的「电视遥控器」就能直接操作投影仪：遥控器上的按键会被
+转成集成自己暴露的 `button` / `remote` 实体，不会绕过集成另起一套协议。
+
+实体 id 默认是 `media_player.<设备名>`（和 `remote` 实体同源，例如
+`media_player.dang_bei_tou_ying`），以实际注册的 id 为准。
+
+### 按键映射
+
+| iOS 遥控器按键 | Home Assistant 侧 | 实际动作 |
+| --- | --- | --- |
+| 上 / 下 / 左 / 右 | `homekit_tv_remote_key_pressed` 事件 | 按下 `button.*_up` / `_down` / `_left` / `_right` |
+| 确定 | 同上 | 按下 `button.*_ok` |
+| 返回 | 同上 | 按下 `button.*_back` |
+| 播放-暂停 | `media_player.media_play` / `media_pause` / `media_play_pause` | 按下 `button.*_home`，即当贝的「主页」键 |
+| 电源 | `media_player.turn_on` / `turn_off` | 调用 `remote.turn_on` / `remote.turn_off` |
+
+行为说明：
+
+- 方向键、确定、返回走 HomeKit 的 `RemoteKey` 特征，HA 会抛
+  `homekit_tv_remote_key_pressed` 事件，**集成内部直接消化，不需要再配自动化或蓝图**。
+- 「播放-暂停」和「电源」**不会抛事件**，所以蓝图配不出来，只能由集成内部处理：
+  `TelevisionMediaPlayer.set_remote_key()` 对 `play_pause` 做了特判（实体一旦声明了
+  `PLAY | PAUSE`，就直接调 media_player 服务并 `return`），而电源键压根不走
+  `RemoteKey`，写的是 HomeKit 的 `Active` 特征。
+- 电源两个方向都是**幂等**的：`turn_on` 只在当前判定为关机时才调 `remote.turn_on`。
+  iOS 在打开遥控器界面时自己也会补写一次 `Active = 1`（它以为配件该被唤醒），
+  如果把 `turn_on` 做成「翻转」，刚打开的投影仪会被下一次按键关掉。
+- 关机状态下 WebSocket 不在线，所以「开机」只能走 `remote.turn_on`（ESP32 BLE 唤醒）。
+  **没配 ESP32 开机盒子时，iOS 遥控器的电源键只能关机、不能开机**。
+- 本集成没有声明音量特性，所以 iOS 遥控器上不会出现音量键（避免出现按了没反应的死键）。
+  需要的话在 `media_player.py` 的 `SUPPORT_DANGBEI_TV` 里加上
+  `MediaPlayerEntityFeature.VOLUME_STEP`，再补 `async_volume_up()` /
+  `async_volume_down()` 两个方法（内部同样按下 `button.*_volume_up` / `_down`）即可。
+- 开关机状态取自电源协调器（探测 6689 端口是否可连），HomeKit 的 `Active` 会跟着它走，
+  所以正常情况下电源键既能关机也能开机。
+
+### 配置
+
+在 `configuration.yaml` 里把那个 `media_player` 实体暴露给 HomeKit：
+
+```yaml
+homekit:
+  - name: 当贝投影
+    mode: accessory                        # 电视配件必须用 accessory 模式
+    port: 21065                            # 不要和已有的 HomeKit 实例撞端口
+    filter:
+      include_entities:
+        - media_player.dang_bei_tou_ying   # ← 换成你的实体 id，且只放这一个实体
+    entity_config:
+      media_player.dang_bei_tou_ying:
+        name: 当贝投影
+```
+
+改完重启 Home Assistant，再在 iOS 家庭 App 里配对这个新增的配件（`accessory` 模式
+每个实例只能含一个实体，所以需要单独配对）。配对完成后从控制中心打开遥控器即可。
+
+> 遥控器只对「电视」配件出现，而配件类型由 `device_class` 硬决定
+> （`tv` / `receiver` / `projector` → `TelevisionMediaPlayer`），所以这个 `media_player`
+> 必须和 `remote` 实体分开：`remote` 实体仍然可以照常给自动化用。
+
+### 排查
+
+- 想知道 HomeKit 到底往 HA 发了什么：
+  - 方向键：开发者工具 → 事件 → 订阅 `homekit_tv_remote_key_pressed`
+  - 电源键：订阅 `homekit_state_change`（注意事件名不是 `homekit_changed`），
+    data 里的 `service` 会是 `turn_on` / `turn_off`
+  - 播放-暂停：`homekit_state_change` 里会出现 `media_play` / `media_pause` /
+    `media_play_pause`
+- 方向键没反应：确认 `filter.include_entities` 里的实体 id 与集成本体一致；
+  投影仪关机时 WebSocket 连不上，按键会发送失败（日志里是 `custom_components.dangbei`
+  的告警），此时方向键要等开机完成后才生效。
+- 按电源键只关机、不开机：检查是否配置了 ESP32 开机盒子。
 
 ## 说明
 
